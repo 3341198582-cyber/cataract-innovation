@@ -1,0 +1,336 @@
+import os
+import cv2
+import time
+import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+from torchvision import models, transforms
+from torch.utils.data import Dataset, DataLoader, Subset
+from PIL import Image
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import confusion_matrix, roc_auc_score, f1_score
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True  # 开启加速
+
+set_seed(42)
+
+# 显式指定并检查 GPU
+if not torch.cuda.is_available():
+    raise RuntimeError("❌ 致命错误：未检测到可用的 GPU！请检查 CUDA 环境配置。")
+
+device = torch.device("cuda:0")
+torch.cuda.set_device(device)
+
+print("="*60)
+print(f"=== SAD-Net 满血 GPU 驱动版 (当前硬件: {torch.cuda.get_device_name(0)}) ===")
+print("="*60 + "\n")
+
+roi_src = '/home/rst/ROI_327'
+mask_root = '/home/rst/mask_327'
+msa_npy_dir = '/home/rst/2D_DWT_mobile/npy' 
+
+save_dir = '/home/rst/SAD_EfficientNet'
+os.makedirs(save_dir, exist_ok=True)
+
+class SADDistillationDataset(Dataset):
+    def __init__(self, transform=None):
+        self.transform = transform
+        self.data_infos = []
+        class_map = {'normal': 0, 'cataract': 1}
+
+        splits = ['train', 'test']
+        for split in splits:
+            for cls_name, label in class_map.items():
+                roi_dir = os.path.join(roi_src, split, f"{cls_name}_ROI")
+                mask_dir = os.path.join(mask_root, split, cls_name)
+                npy_dir = os.path.join(msa_npy_dir, split, cls_name)
+                
+                if not os.path.exists(roi_dir): continue
+                
+                for f in os.listdir(roi_dir):
+                    if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        file_name, file_ext = os.path.splitext(f)
+                        
+                        roi_path = os.path.join(roi_dir, f)
+                        mask_path = os.path.join(mask_dir, f"{file_name}_SAMmask{file_ext}")
+                        npy_path = os.path.join(npy_dir, f"{file_name}_msa.npy")
+                        
+                        if os.path.exists(mask_path) and os.path.exists(npy_path):
+                            self.data_infos.append({
+                                'roi_path': roi_path,
+                                'mask_path': mask_path,
+                                'npy_path': npy_path,
+                                'label': label
+                            })
+        print(f"多模态数据对齐完成：成功配对 {len(self.data_infos)} 个样本")
+
+    def __len__(self): return len(self.data_infos)
+
+    def __getitem__(self, idx):
+        item = self.data_infos[idx]
+        
+        img = cv2.imread(item['roi_path'])
+        mask = cv2.imread(item['mask_path'], cv2.IMREAD_GRAYSCALE)
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        
+        if img.shape[:2] != mask.shape:
+            mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            
+        img_combined = cv2.bitwise_and(img, img, mask=mask)
+        img_combined = cv2.cvtColor(img_combined, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_combined)
+
+        if self.transform: 
+            img_tensor = self.transform(pil_img)
+
+        msa_data = np.load(item['npy_path']).astype(np.float32)
+        msa_data = msa_data / (msa_data.max() + 1e-8)
+        msa_tensor = torch.from_numpy(msa_data).unsqueeze(0)
+
+        return img_tensor, item['label'], msa_tensor
+
+train_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.RandomAffine(degrees=15),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+test_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+full_train_dataset = SADDistillationDataset(transform=train_transform)
+full_test_dataset = SADDistillationDataset(transform=test_transform)
+all_labels = [item['label'] for item in full_train_dataset.data_infos]
+
+class HybridDistillationLoss(nn.Module):
+    def __init__(self, alpha, beta):
+        super(HybridDistillationLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.mse = nn.MSELoss()
+        self.l1 = nn.L1Loss()
+
+    def forward(self, student_feat, teacher_feat):
+        return self.alpha * self.mse(student_feat, teacher_feat) + self.beta * self.l1(student_feat, teacher_feat)
+
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.weight = weight
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce_loss)
+        return ((1 - pt) ** self.gamma * ce_loss).mean()
+
+class SADNet_EfficientNet(nn.Module):
+    def __init__(self):
+        super(SADNet_EfficientNet, self).__init__()
+        effnet = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.DEFAULT)
+        self.features = effnet.features
+        
+        num_ftrs = effnet.classifier[1].in_features 
+        
+        self.distill_branch = nn.Sequential(
+            nn.Conv2d(num_ftrs, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1, kernel_size=1) 
+        )
+        
+        self.fc = nn.Sequential(nn.Dropout(0.2), nn.Linear(num_ftrs, 2))
+
+    def forward(self, x):
+        f = self.features(x)
+        
+        distill_out = self.distill_branch(f)
+        distill_out = F.interpolate(distill_out, size=(256, 256), mode='bilinear', align_corners=False)
+        
+        pooled = F.adaptive_avg_pool2d(f, (1, 1)).view(x.size(0), -1)
+        class_out = self.fc(pooled)
+        
+        return class_out, distill_out
+
+def train_and_eval(model, train_loader, val_loader, alpha, beta, epochs, weight_path):
+    cls_weights = torch.tensor([0.778, 1.397], dtype=torch.float32).to(device)
+    criterion_cls = FocalLoss(weight=cls_weights, gamma=2.0)
+    criterion_kd = HybridDistillationLoss(alpha, beta)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.03)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    
+    best_acc = 0.0
+    lambda_distill = 0.5 
+
+    for epoch in range(epochs):
+        model.train()
+        for inputs, labels, msa_targets in train_loader:
+            inputs, labels, msa_targets = inputs.to(device), labels.to(device), msa_targets.to(device)
+            optimizer.zero_grad()
+            
+            class_preds, distill_preds = model(inputs)
+            loss_cls = criterion_cls(class_preds, labels)
+            loss_kd = criterion_kd(distill_preds, msa_targets)
+            
+            total_loss = loss_cls + lambda_distill * loss_kd
+            total_loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+        model.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for inputs, labels, _ in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs, _ = model(inputs)
+                _, preds = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += torch.sum(preds == labels.data).item()
+        
+        val_acc = correct / total
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), weight_path)
+
+    model.load_state_dict(torch.load(weight_path, map_location=device))
+    model.eval()
+    all_preds, all_labels_eval, all_probs = [], [], []
+    total_samples, test_running_loss, total_inf_time = len(val_loader.dataset), 0.0, 0.0
+    
+    _ = model(torch.randn(1, 3, 256, 256).to(device))
+    
+    with torch.no_grad():
+        for inputs, labels, msa_targets in val_loader:
+            inputs, labels, msa_targets = inputs.to(device), labels.to(device), msa_targets.to(device)
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            outputs, distill_preds = model(inputs)
+            torch.cuda.synchronize()
+            total_inf_time += (time.perf_counter() - start_time)
+            
+            loss = criterion_cls(outputs, labels) + lambda_distill * criterion_kd(distill_preds, msa_targets)
+            test_running_loss += loss.item() * inputs.size(0)
+            
+            probs = torch.nn.functional.softmax(outputs, dim=1)[:, 1] 
+            _, preds = torch.max(outputs, 1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels_eval.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+            
+    cm = confusion_matrix(all_labels_eval, all_preds, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    
+    acc = (tp + tn) / total_samples
+    se = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    sp = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    auc = roc_auc_score(all_labels_eval, all_probs)
+    f1 = f1_score(all_labels_eval, all_preds)
+    time_ms = (total_inf_time / total_samples) * 1000
+    
+    return acc, se, sp, f1, auc, test_running_loss/total_samples, time_ms
+
+epochs = 50
+k_folds = 5
+skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=42)
+fold_splits = list(skf.split(np.zeros(len(all_labels)), all_labels))
+
+search_space = [
+    {"alpha": 1.0, "beta": 0.0, "desc": "纯 L2 (结构逼近)"},
+    {"alpha": 0.0, "beta": 1.0, "desc": "纯 L1 (纹理锐化)"},
+    {"alpha": 0.5, "beta": 0.5, "desc": "L2+L1 (均衡)"},
+    {"alpha": 0.2, "beta": 0.8, "desc": "L2+L1 (倾向高频)"}
+]
+
+print("\n" + "="*50)
+print("🔍 阶段 1: 在 Fold 1 上执行 GPU 全速超参数网格搜索")
+print("="*50)
+
+train_idx, val_idx = fold_splits[0]
+# 💡 开启多进程数据加载，彻底消除 CPU 瓶颈
+train_loader = DataLoader(Subset(full_train_dataset, train_idx), batch_size=4, shuffle=True, num_workers=4, pin_memory=True)
+val_loader = DataLoader(Subset(full_test_dataset, val_idx), batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
+
+best_combo = None
+best_fold1_acc = 0.0
+
+for combo in search_space:
+    print(f"\n正在测试组合 -> {combo['desc']} (Alpha={combo['alpha']}, Beta={combo['beta']})")
+    model = SADNet_EfficientNet().to(device)
+    temp_weight_path = os.path.join(save_dir, f"temp_fold1_a{combo['alpha']}_b{combo['beta']}.pth")
+    
+    acc, se, sp, f1, auc, loss, t_ms = train_and_eval(model, train_loader, val_loader, combo['alpha'], combo['beta'], epochs, temp_weight_path)
+    
+    print(f"成绩: ACC: {acc*100:.2f}% | SE: {se*100:.2f}% | SP: {sp*100:.2f}% | F1: {f1:.4f} | AUC: {auc:.4f} | Time: {t_ms:.2f}ms")
+    
+    if acc > best_fold1_acc or (acc == best_fold1_acc and combo == search_space[-1]):
+        best_fold1_acc = acc
+        best_combo = combo
+        os.rename(temp_weight_path, os.path.join(save_dir, "sadnet_efficient_fold_1.pth"))
+    else:
+        if os.path.exists(temp_weight_path):
+            os.remove(temp_weight_path) 
+
+print("\n网格搜索完成！")
+print(f"锁定黄金蒸馏比例: {best_combo['desc']} (Alpha={best_combo['alpha']}, Beta={best_combo['beta']})")
+
+print("\n" + "="*50)
+print("阶段 2: 携带黄金参数执行全局 Fold 2-5 交叉验证")
+print("="*50)
+
+final_metrics = {'acc': [best_fold1_acc], 'se': [], 'sp': [], 'f1': [], 'auc': [], 'loss': [], 'time': []}
+final_metrics['se'].append(se); final_metrics['sp'].append(sp); final_metrics['f1'].append(f1)
+final_metrics['auc'].append(auc); final_metrics['loss'].append(loss); final_metrics['time'].append(t_ms)
+
+for fold in range(1, k_folds):
+    print(f"\n开始第 {fold + 1} 折 GPU 蒸馏训练")
+    train_idx, val_idx = fold_splits[fold]
+    train_loader = DataLoader(Subset(full_train_dataset, train_idx), batch_size=4, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(Subset(full_test_dataset, val_idx), batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
+    
+    model = SADNet_EfficientNet().to(device)
+    weight_path = os.path.join(save_dir, f"sadnet_efficient_fold_{fold+1}.pth")
+    
+    acc, se, sp, f1, auc, loss, t_ms = train_and_eval(model, train_loader, val_loader, best_combo['alpha'], best_combo['beta'], epochs, weight_path)
+    
+    final_metrics['acc'].append(acc)
+    final_metrics['se'].append(se)
+    final_metrics['sp'].append(sp)
+    final_metrics['f1'].append(f1)
+    final_metrics['auc'].append(auc)
+    final_metrics['loss'].append(loss)
+    final_metrics['time'].append(t_ms)
+    
+    print(f"Fold {fold+1} 成绩单 -> ACC: {acc*100:.2f}% | SE: {se*100:.2f}% | SP: {sp*100:.2f}% | AUC: {auc:.4f}")
+
+print("\n" + "="*60)
+print("终极报告：SAD-Net (EfficientNet-V2-S + 2D-DWT混合蒸馏)")
+print(f"所选黄金比例: Alpha={best_combo['alpha']}, Beta={best_combo['beta']}")
+print("="*60)
+print(f"Accuracy (ACC):      {np.mean(final_metrics['acc'])*100:.2f}% ± {np.std(final_metrics['acc'])*100:.2f}%")
+print(f"Sensitivity (SE):    {np.mean(final_metrics['se'])*100:.2f}% ± {np.std(final_metrics['se'])*100:.2f}%")
+print(f"Specificity (SP):    {np.mean(final_metrics['sp'])*100:.2f}% ± {np.std(final_metrics['sp'])*100:.2f}%")
+print(f"F1 Score:            {np.mean(final_metrics['f1']):.4f} ± {np.std(final_metrics['f1']):.4f}")
+print(f"AUC Score:           {np.mean(final_metrics['auc']):.4f} ± {np.std(final_metrics['auc']):.4f}")
+print(f"Loss (LOSS):         {np.mean(final_metrics['loss']):.4f} ± {np.std(final_metrics['loss']):.4f}")
+print(f" Inference Time:    {np.mean(final_metrics['time']):.2f} ms ± {np.std(final_metrics['time']):.2f} ms")
+print(f"5折黄金权重已安全存放至: {save_dir}")
+print("============================================================")

@@ -1,0 +1,209 @@
+import os
+import cv2
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from torchvision import models, transforms
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+output_dir = '/home/rst/Uncertainty_calibration'
+os.makedirs(output_dir, exist_ok=True)
+
+print("="*60)
+print("=== SAD-Net MC Dropout 不确定性量化与校准图表生成 ===")
+print(f"=== 结果输出文件夹: {output_dir} ===")
+print("="*60 + "\n")
+
+roi_src_422 = '/home/rst/422ROI'
+mask_root_422 = '/home/rst/422mask'
+finetuned_weight = '/home/rst/SAD_EfficientNet/sadnet_422_finetuned.pth'
+
+class SADNet_MC_Inference(nn.Module):
+    def __init__(self, dropout_rate=0.3):
+        super(SADNet_MC_Inference, self).__init__()
+        effnet = models.efficientnet_v2_s(weights=None)
+        self.features = effnet.features
+        num_ftrs = effnet.classifier[1].in_features 
+        
+        self.distill_branch = nn.Sequential(
+            nn.Conv2d(num_ftrs, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1, kernel_size=1) 
+        )
+        
+        self.fc = nn.Sequential(
+            nn.Dropout(p=dropout_rate, inplace=False), 
+            nn.Linear(num_ftrs, 2)
+        )
+
+    def forward(self, x):
+        f = self.features(x)
+        pooled = F.adaptive_avg_pool2d(f, (1, 1)).view(x.size(0), -1)
+        return self.fc(pooled)
+
+    def train(self, mode=True):
+        super().train(mode)
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+class ExternalValidationDataset(Dataset):
+    def __init__(self, data_infos, transform=None):
+        self.transform = transform
+        self.data_infos = data_infos
+
+    def __len__(self): return len(self.data_infos)
+
+    def __getitem__(self, idx):
+        item = self.data_infos[idx]
+        img = cv2.imread(item['roi_path'])
+        mask = cv2.imread(item['mask_path'], cv2.IMREAD_GRAYSCALE)
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        if img.shape[:2] != mask.shape:
+            mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+        img_combined = cv2.bitwise_and(img, img, mask=mask)
+        img_combined = cv2.cvtColor(img_combined, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_combined)
+        if self.transform: img_tensor = self.transform(pil_img)
+        return img_tensor, item['label']
+
+all_data_infos = []
+class_map = {'normal': 0, 'cataract': 1}
+for cls_name, label in class_map.items():
+    roi_dir = os.path.join(roi_src_422, f"{cls_name}_ROI")
+    if not os.path.exists(roi_dir): roi_dir = os.path.join(roi_src_422, cls_name)
+    mask_dir = os.path.join(mask_root_422, cls_name)
+    if not os.path.exists(roi_dir): continue
+    for f in os.listdir(roi_dir):
+        if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+            file_name, file_ext = os.path.splitext(f)
+            mask_path = os.path.join(mask_dir, f"{file_name}_SAMmask{file_ext}")
+            if os.path.exists(mask_path):
+                all_data_infos.append({'roi_path': os.path.join(roi_dir, f), 'mask_path': mask_path, 'label': label})
+
+labels_for_split = [item['label'] for item in all_data_infos]
+_, test_infos = train_test_split(all_data_infos, test_size=0.80, stratify=labels_for_split, random_state=42)
+
+test_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+test_loader = DataLoader(ExternalValidationDataset(test_infos, test_transform), batch_size=1, shuffle=False)
+
+model = SADNet_MC_Inference(dropout_rate=0.3).to(device)
+model.load_state_dict(torch.load(finetuned_weight, map_location=device), strict=False)
+model.train() # 激活 MC Dropout
+
+T = 50 
+all_confidences = []
+all_uncertainties = []
+all_preds = []
+all_labels = []
+
+print(f"开始对 {len(test_infos)} 张测试图像进行 T={T} 次循环前向采样推理...")
+
+with torch.no_grad():
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        monte_carlo_logits = []
+        for _ in range(T):
+            outputs = model(inputs)
+            probs = F.softmax(outputs, dim=1)
+            monte_carlo_logits.append(probs.cpu().numpy())
+            
+        mc_preds = np.squeeze(np.array(monte_carlo_logits), axis=1) 
+        mean_prob_vector = np.mean(mc_preds, axis=0)
+        
+        # 最高平均概率作为模型置信度 (Confidence)
+        confidence = np.max(mean_prob_vector)
+        
+        # 信息熵作为不确定性得分
+        entropy = -np.sum(mean_prob_vector * np.log(mean_prob_vector + 1e-8))
+
+        pred_label = np.argmax(mean_prob_vector)
+        
+        all_confidences.append(confidence)
+        all_uncertainties.append(entropy)
+        all_preds.append(pred_label)
+        all_labels.append(labels.item())
+
+all_preds = np.array(all_preds)
+all_labels = np.array(all_labels)
+all_confidences = np.array(all_confidences)
+all_uncertainties = np.array(all_uncertainties)
+correct_mask = (all_preds == all_labels)
+
+fig_path_1 = os.path.join(output_dir, 'uncertainty_distribution.png')
+plt.figure(figsize=(8, 6), dpi=300)
+sns.set_theme(style="whitegrid")
+
+df_plot = pd.DataFrame({
+    'Uncertainty (Entropy)': all_uncertainties,
+    'Prediction Status': np.where(correct_mask, 'Correct Predictions (N={})'.format(np.sum(correct_mask)), 
+                                  'Incorrect Predictions (N={})'.format(np.sum(~correct_mask)))
+})
+
+ax = sns.violinplot(x='Prediction Status', y='Uncertainty (Entropy)', data=df_plot, 
+                    palette=["#2ecc71", "#e74c3c"], inner="box", cut=0, alpha=0.8)
+plt.title("Epistemic Uncertainty Distribution (MC Dropout, T=50)", fontsize=13, fontweight='bold', pad=15)
+plt.xlabel("Model Prediction Status", fontsize=11, fontweight='bold')
+plt.ylabel("Uncertainty Score (Predictive Entropy)", fontsize=11, fontweight='bold')
+plt.tight_layout()
+plt.savefig(fig_path_1, dpi=300)
+plt.close()
+print(f"图一已保存: {fig_path_1}")
+
+fig_path_2 = os.path.join(output_dir, 'reliability_diagram.png')
+plt.figure(figsize=(7, 7), dpi=300)
+
+n_bins = 10
+bins = np.linspace(0.0, 1.0, n_bins + 1)
+bin_centers = (bins[:-1] + bins[1:]) / 2
+
+bin_accuracies = []
+bin_confidences = []
+ece = 0.0
+total_samples = len(all_labels)
+
+for i in range(n_bins):
+    bin_lower = bins[i]
+    bin_upper = bins[i + 1]
+    in_bin = (all_confidences > bin_lower) & (all_confidences <= bin_upper)
+    bin_size = np.sum(in_bin)
+    
+    if bin_size > 0:
+        bin_acc = np.mean(correct_mask[in_bin])
+        bin_conf = np.mean(all_confidences[in_bin])
+        bin_accuracies.append(bin_acc)
+        bin_confidences.append(bin_conf)
+        ece += (bin_size / total_samples) * np.abs(bin_acc - bin_conf)
+    else:
+        bin_accuracies.append(0)
+        bin_confidences.append(bin_centers[i])
+
+plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Perfect Calibration')
+plt.bar(bin_centers, bin_accuracies, width=1.0/n_bins, alpha=0.7, edgecolor='black', color='#3498db', label='Outputs')
+
+plt.xlim(0, 1)
+plt.ylim(0, 1)
+plt.xlabel("Confidence", fontsize=12, fontweight='bold')
+plt.ylabel("Accuracy", fontsize=12, fontweight='bold')
+plt.title(f"Reliability Diagram (ECE = {ece:.4f})", fontsize=14, fontweight='bold', pad=15)
+plt.legend(loc='upper left', frameon=True)
+plt.tight_layout()
+plt.savefig(fig_path_2, dpi=300)
+plt.close()
+print(f"图二已保存: {fig_path_2}")
+
+print(f"\n所有分析图表已全部安全打包存放至目录: {output_dir}")

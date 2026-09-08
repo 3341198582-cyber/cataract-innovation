@@ -1,0 +1,61 @@
+import os
+import pandas as pd
+import networkx as nx
+
+def clean_duplicates_absolute(excel_path, base_linux_dir):
+    print("正在读取 Excel 报告并构建关系网...")
+    df = pd.read_excel(excel_path)
+    
+    # 提取完全相同的图片
+    df_exact = df[df['汉明距离'] == 0]
+    
+    # 构建图找出连环重复的簇
+    G = nx.Graph()
+    for _, row in df_exact.iterrows():
+        G.add_edge(row['图名1'], row['图名2'])
+        
+    components = list(nx.connected_components(G))
+    to_delete = []
+    
+    # 每组保留一张，优先保留 train
+    for comp in components:
+        comp = list(comp)
+        comp.sort(key=lambda x: (0 if 'train' in x else 1, x))
+        to_delete.extend(comp[1:])
+        
+    print(f"计算完毕，即将执行绝对路径物理删除，共计 {len(to_delete)} 张废图...")
+    
+    # 执行物理删除
+    deleted_count = 0
+    not_found_count = 0
+    
+    for excel_path_str in to_delete:
+        # excel_path_str 类似 '眼睛照片512/test/cataract/image_281.png'
+        # base_linux_dir 是 '/home/rst/612_original_data'
+        # 拼出来的完美绝对路径：/home/rst/612_original_data/眼睛照片512/test/cataract/image_281.png
+        
+        full_target_path = os.path.join(base_linux_dir, excel_path_str).replace('\\', '/')
+        
+        if os.path.exists(full_target_path):
+            os.remove(full_target_path)
+            deleted_count += 1
+        else:
+            not_found_count += 1
+            # 把找不到的文件名打印出来看看是哪里不对
+            print(f"依然未找到: {full_target_path}")
+            
+    print("-" * 40)
+    print("清理任务彻底完成！")
+    print(f"成功物理删除图片: {deleted_count} 张")
+    if not_found_count > 0:
+        print(f"⚠️ 未找到的图片: {not_found_count} 张")
+    print("-" * 40)
+
+if __name__ == "__main__":
+    # Excel 文件的路径（请确保和你在同一个目录下，或者写绝对路径）
+    EXCEL_FILE = '白内障全图库去重报告.xlsx' 
+    
+    # 你在 Ubuntu 上的绝对根目录
+    LINUX_BASE_DIR = '/home/rst/612_original_data'  
+    
+    clean_duplicates_absolute(EXCEL_FILE, LINUX_BASE_DIR)

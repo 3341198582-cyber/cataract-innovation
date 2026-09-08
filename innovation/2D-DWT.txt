@@ -1,0 +1,117 @@
+import os
+import cv2
+import numpy as np
+import pywt
+
+# ==========================================
+# 1. 路径严格配置
+# ==========================================
+roi_src = '/home/rst/ROI_327'
+mask_root = '/home/rst/mask_327'
+
+# 主输出目录
+save_dir = '/home/rst/2D_DWT'
+npy_save_dir = os.path.join(save_dir, 'npy')
+png_save_dir = os.path.join(save_dir, 'png')
+
+os.makedirs(npy_save_dir, exist_ok=True)
+os.makedirs(png_save_dir, exist_ok=True)
+
+print(f"=== 🌊 SAD-Net 物理先验: 2D-DWT 与 MSA 均方幅值特征提取 ===")
+print(f"目标目录: {save_dir}\n")
+
+# ==========================================
+# 2. 核心处理循环
+# ==========================================
+class_map = ['normal', 'cataract']
+splits = ['train', 'test']
+
+processed_count = 0
+
+for split in splits:
+    for cls_name in class_map:
+        roi_dir = os.path.join(roi_src, split, f"{cls_name}_ROI")
+        mask_dir = os.path.join(mask_root, split, cls_name)
+        
+        if not os.path.exists(roi_dir): 
+            continue
+            
+        # 在 npy 和 png 下分别建好 train/test 和 类别 子文件夹
+        sub_npy_dir = os.path.join(npy_save_dir, split, cls_name)
+        sub_png_dir = os.path.join(png_save_dir, split, cls_name)
+        os.makedirs(sub_npy_dir, exist_ok=True)
+        os.makedirs(sub_png_dir, exist_ok=True)
+        
+        for f in os.listdir(roi_dir):
+            if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                roi_path = os.path.join(roi_dir, f)
+                file_name, file_ext = os.path.splitext(f)
+                mask_name = f"{file_name}_SAMmask{file_ext}"
+                mask_path = os.path.join(mask_dir, mask_name)
+                
+                if not os.path.exists(mask_path):
+                    continue
+                    
+                # ---------------------------------------------------
+                # 步骤 A: 图像读取与掩膜对齐 (剔除虚假背景边缘)
+                # ---------------------------------------------------
+                img = cv2.imread(roi_path)
+                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+                
+                if img.shape[:2] != mask.shape:
+                    mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+                    
+                # 融合后转为单通道灰度图，专供小波变换提取结构纹理
+                img_combined = cv2.bitwise_and(img, img, mask=mask)
+                img_gray = cv2.cvtColor(img_combined, cv2.COLOR_BGR2GRAY)
+                
+                # ---------------------------------------------------
+                # 步骤 B: 2D-DWT (Haar 小波分解)
+                # ---------------------------------------------------
+                # 分解得到: LL(低频近似), (LH(水平高频), HL(垂直高频), HH(对角高频))
+                coeffs2 = pywt.dwt2(img_gray, 'haar')
+                LL, (LH, HL, HH) = coeffs2
+                
+                # ---------------------------------------------------
+                # 步骤 C: MSA (均方幅值) 计算
+                # ---------------------------------------------------
+                # 物理意义：融合三个方向的高频能量，代表病灶的浑浊纹理剧烈程度
+                msa = (np.square(LH) + np.square(HL) + np.square(HH)) / 3.0
+                
+                # 空间对齐：插值放大到 256x256，与 EfficientNet 提取的特征图绝对对齐
+                msa_resized = cv2.resize(msa, (256, 256), interpolation=cv2.INTER_CUBIC)
+                
+                # ---------------------------------------------------
+                # 步骤 D: 高精度存储供 SAD-Net 蒸馏使用
+                # ---------------------------------------------------
+                npy_file = os.path.join(sub_npy_dir, f"{file_name}_msa.npy")
+                np.save(npy_file, msa_resized)
+                
+                # ---------------------------------------------------
+                # 步骤 E: 论文插图可视化输出 (仅 PNG 供作图使用)
+                # ---------------------------------------------------
+                # 1. 保存 MSA 伪彩色热力图
+                msa_norm = cv2.normalize(msa_resized, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                msa_heatmap = cv2.applyColorMap(msa_norm, cv2.COLORMAP_JET)
+                cv2.imwrite(os.path.join(sub_png_dir, f"{file_name}_MSA_heatmap.png"), msa_heatmap)
+                
+                # 2. 保存四个物理分解子带的灰度图 (写论文分析用)
+                def save_subband(subband_data, suffix):
+                    # 绝对值化并归一化到 0-255 显示
+                    sub_norm = cv2.normalize(np.abs(subband_data), None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                    cv2.imwrite(os.path.join(sub_png_dir, f"{file_name}_{suffix}.png"), sub_norm)
+                
+                save_subband(LL, "1_LL_Approx")
+                save_subband(LH, "2_LH_Horizontal")
+                save_subband(HL, "3_HL_Vertical")
+                save_subband(HH, "4_HH_Diagonal")
+                
+                processed_count += 1
+                if processed_count % 50 == 0:
+                    print(f"已物理分解并计算 {processed_count} 张图像的 MSA 特征...")
+
+print(f"\n物理特征提取完毕！共处理 {processed_count} 张图像。")
+print(f"蒸馏训练专用 MSA 矩阵: {npy_save_dir}")
+print(f"论文插图专用 分解/热力图: {png_save_dir}")
+print("==================================================")
