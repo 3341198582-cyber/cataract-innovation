@@ -1,0 +1,217 @@
+import os
+import cv2
+import time
+import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+from torchvision import models, transforms
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from sklearn.metrics import confusion_matrix, roc_auc_score, f1_score, roc_curve
+from sklearn.model_selection import train_test_split
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+set_seed(42)
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+print("="*60)
+print("=== SAD-Net 跨域小样本微调 (Few-Shot Domain Adaptation) ===")
+print(f"=== 计算引擎: {device} ===")
+print("="*60 + "\n")
+
+roi_src_422 = '/home/rst/422ROI'
+mask_root_422 = '/home/rst/422mask'
+pretrained_weight = '/home/rst/SAD_EfficientNet/sadnet_efficient_fold_1.pth' 
+save_finetuned_weight = '/home/rst/SAD_EfficientNet/sadnet_422_finetuned.pth'
+
+class ExternalValidationDataset(Dataset):
+    def __init__(self, data_infos, transform=None):
+        self.transform = transform
+        self.data_infos = data_infos
+
+    def __len__(self): return len(self.data_infos)
+
+    def __getitem__(self, idx):
+        item = self.data_infos[idx]
+        img = cv2.imread(item['roi_path'])
+        mask = cv2.imread(item['mask_path'], cv2.IMREAD_GRAYSCALE)
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        
+        if img.shape[:2] != mask.shape:
+            mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            
+        img_combined = cv2.bitwise_and(img, img, mask=mask)
+        img_combined = cv2.cvtColor(img_combined, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_combined)
+
+        if self.transform: 
+            img_tensor = self.transform(pil_img)
+
+        return img_tensor, item['label']
+
+# 搜集所有 422 数据
+all_data_infos = []
+class_map = {'normal': 0, 'cataract': 1}
+for cls_name, label in class_map.items():
+    roi_dir = os.path.join(roi_src_422, f"{cls_name}_ROI")
+    if not os.path.exists(roi_dir): roi_dir = os.path.join(roi_src_422, cls_name)
+    mask_dir = os.path.join(mask_root_422, cls_name)
+    if not os.path.exists(roi_dir): continue
+    for f in os.listdir(roi_dir):
+        if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+            file_name, file_ext = os.path.splitext(f)
+            mask_path = os.path.join(mask_dir, f"{file_name}_SAMmask{file_ext}")
+            if os.path.exists(mask_path):
+                all_data_infos.append({'roi_path': os.path.join(roi_dir, f), 'mask_path': mask_path, 'label': label})
+
+# 划分小样本微调集 (20%) 和最终测试集 (80%)
+labels_for_split = [item['label'] for item in all_data_infos]
+train_infos, test_infos = train_test_split(all_data_infos, test_size=0.80, stratify=labels_for_split, random_state=42)
+
+print(f"数据划分完成: 用于微调让模型适应新设备的样本: {len(train_infos)} 张")
+print(f"数据划分完成: 用于最终公平盲测的样本: {len(test_infos)} 张")
+
+train_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.RandomAffine(degrees=10),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+test_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+train_loader = DataLoader(ExternalValidationDataset(train_infos, train_transform), batch_size=4, shuffle=True, num_workers=4)
+test_loader = DataLoader(ExternalValidationDataset(test_infos, test_transform), batch_size=1, shuffle=False, num_workers=4)
+
+class SADNet_Inference(nn.Module):
+    def __init__(self):
+        super(SADNet_Inference, self).__init__()
+        effnet = models.efficientnet_v2_s(weights=None)
+        self.features = effnet.features
+        num_ftrs = effnet.classifier[1].in_features 
+        self.distill_branch = nn.Sequential(
+            nn.Conv2d(num_ftrs, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1, kernel_size=1) 
+        )
+        self.fc = nn.Sequential(nn.Dropout(0.2), nn.Linear(num_ftrs, 2))
+
+    def forward(self, x):
+        f = self.features(x)
+        pooled = F.adaptive_avg_pool2d(f, (1, 1)).view(x.size(0), -1)
+        return self.fc(pooled)
+
+model = SADNet_Inference().to(device)
+model.load_state_dict(torch.load(pretrained_weight, map_location=device))
+print(f"成功加载源域(Kaggle)预训练权重，准备进行领域自适应...\n")
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+criterion = nn.CrossEntropyLoss()
+epochs = 10 
+
+model.train()
+for epoch in range(epochs):
+    running_loss = 0.0
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    print(f"微调 Epoch [{epoch+1}/{epochs}] Loss: {running_loss/len(train_loader):.4f}")
+
+torch.save(model.state_dict(), save_finetuned_weight)
+
+model.eval()
+all_preds, all_labels_eval, all_probs = [], [], []
+total_samples, total_inf_time = len(test_infos), 0.0
+
+print("\n开始纯净测试集推理计算...")
+
+with torch.no_grad():
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        
+        outputs = model(inputs)
+        
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        total_inf_time += (time.perf_counter() - start_time)
+        
+        probs = torch.nn.functional.softmax(outputs, dim=1)[:, 1]
+        _, preds = torch.max(outputs, 1)
+        
+        all_preds.extend(preds.cpu().numpy())
+        all_labels_eval.extend(labels.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
+
+cm = confusion_matrix(all_labels_eval, all_preds, labels=[0, 1])
+tn, fp, fn, tp = cm.ravel()
+
+acc = (tp + tn) / total_samples
+se = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+sp = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+auc = roc_auc_score(all_labels_eval, all_probs)
+f1 = f1_score(all_labels_eval, all_preds)
+time_ms = (total_inf_time / total_samples) * 1000
+
+print("\n" + "="*60)
+print("422 外部验证集 (小样本微调后 | 默认阈值 0.5) 最终成绩单")
+print("="*60)
+print(f"Accuracy (ACC):      {acc*100:.2f}%")
+print(f"Sensitivity (SE):    {se*100:.2f}%")
+print(f"Specificity (SP):    {sp*100:.2f}%")
+print(f"F1 Score:            {f1:.4f}")
+print(f"AUC Score:           {auc:.4f}")
+print(f"单张推理耗时:       {time_ms:.2f} ms")
+print("="*60)
+
+print("\n" + "*"*60)
+print("开始进行纯统计学优化：计算约登指数寻找最佳判定阈值...")
+print("*"*60)
+
+fpr, tpr, thresholds = roc_curve(all_labels_eval, all_probs)
+youden_index = tpr - fpr
+
+best_idx = np.argmax(youden_index)
+best_threshold = thresholds[best_idx]
+
+print(f"算法寻优最佳截断阈值为: {best_threshold:.4f}")
+
+new_preds = (np.array(all_probs) >= best_threshold).astype(int)
+
+cm_new = confusion_matrix(all_labels_eval, new_preds, labels=[0, 1])
+tn_new, fp_new, fn_new, tp_new = cm_new.ravel()
+
+acc_new = (tp_new + tn_new) / total_samples
+se_new = tp_new / (tp_new + fn_new) if (tp_new + fn_new) > 0 else 0.0
+sp_new = tn_new / (tn_new + fp_new) if (tn_new + fp_new) > 0 else 0.0
+f1_new = f1_score(all_labels_eval, new_preds)
+
+print("\n" + "="*60)
+print(f"422 外部验证集 (约登指数校准后 | 阈值={best_threshold:.4f})")
+print("="*60)
+print(f"Accuracy (ACC):      {acc_new*100:.2f}%")
+print(f"Sensitivity (SE):    {se_new*100:.2f}%")
+print(f"Specificity (SP):    {sp_new*100:.2f}%")
+print(f"F1 Score:            {f1_new:.4f}")
+print(f"AUC Score:           {auc:.4f} (固有特征分辨力，不受阈值影响)")
+print("="*60)

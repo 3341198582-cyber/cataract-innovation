@@ -1,0 +1,173 @@
+import os
+import cv2
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from torchvision import models, transforms
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from sklearn.metrics import confusion_matrix, roc_auc_score, f1_score
+
+# 直接在 PyTorch 层面指定分配到 CPU，绝不修改 CUDA_VISIBLE_DEVICES
+device = torch.device("cpu")
+
+print("="*60)
+print("=== SAD-Net 外部跨域验证 (422 Dataset) ===")
+print("=== 计算引擎: 纯 CPU (安全版，不影响 GPU 生态) ===")
+print("="*60 + "\n")
+
+# 严格指向 422 外部数据集路径
+roi_src_422 = '/home/rst/422ROI'
+mask_root_422 = '/home/rst/422mask'
+weights_dir = '/home/rst/SAD_EfficientNet'
+
+
+class ExternalValidationDataset(Dataset):
+    def __init__(self, transform=None):
+        self.transform = transform
+        self.data_infos = []
+        class_map = {'normal': 0, 'cataract': 1}
+
+        for cls_name, label in class_map.items():
+            roi_dir = os.path.join(roi_src_422, f"{cls_name}_ROI")
+            if not os.path.exists(roi_dir):
+                roi_dir = os.path.join(roi_src_422, cls_name)
+                
+            mask_dir = os.path.join(mask_root_422, cls_name)
+            
+            if not os.path.exists(roi_dir): continue
+            
+            for f in os.listdir(roi_dir):
+                if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    file_name, file_ext = os.path.splitext(f)
+                    
+                    roi_path = os.path.join(roi_dir, f)
+                    mask_path = os.path.join(mask_dir, f"{file_name}_SAMmask{file_ext}")
+                    
+                    if os.path.exists(mask_path):
+                        self.data_infos.append({
+                            'roi_path': roi_path,
+                            'mask_path': mask_path,
+                            'label': label
+                        })
+        print(f"422 外部验证集装载完成：共成功对齐 {len(self.data_infos)} 张测试样本 (原图+掩膜)")
+
+    def __len__(self): return len(self.data_infos)
+
+    def __getitem__(self, idx):
+        item = self.data_infos[idx]
+        
+        img = cv2.imread(item['roi_path'])
+        mask = cv2.imread(item['mask_path'], cv2.IMREAD_GRAYSCALE)
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        
+        if img.shape[:2] != mask.shape:
+            mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            
+        img_combined = cv2.bitwise_and(img, img, mask=mask)
+        img_combined = cv2.cvtColor(img_combined, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_combined)
+
+        if self.transform: 
+            img_tensor = self.transform(pil_img)
+
+        return img_tensor, item['label']
+
+# 外部验证绝对不能做数据增强
+test_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+test_dataset = ExternalValidationDataset(transform=test_transform)
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4) 
+
+class SADNet_Inference(nn.Module):
+    def __init__(self):
+        super(SADNet_Inference, self).__init__()
+        effnet = models.efficientnet_v2_s(weights=None) 
+        self.features = effnet.features
+        num_ftrs = effnet.classifier[1].in_features 
+        
+        # 保留结构以接收字典，但前向传播丢弃
+        self.distill_branch = nn.Sequential(
+            nn.Conv2d(num_ftrs, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1, kernel_size=1) 
+        )
+        self.fc = nn.Sequential(nn.Dropout(0.2), nn.Linear(num_ftrs, 2))
+
+    def forward(self, x):
+        f = self.features(x)
+        pooled = F.adaptive_avg_pool2d(f, (1, 1)).view(x.size(0), -1)
+        class_out = self.fc(pooled)
+        return class_out
+
+models_ensemble = []
+for fold in range(1, 6):
+    weight_path = os.path.join(weights_dir, f"sadnet_efficient_fold_{fold}.pth")
+    if os.path.exists(weight_path):
+        model = SADNet_Inference().to(device) # 放入 CPU
+        # 核心：无论当时权重是在哪张 GPU 上训练的，读取时统统映射到 CPU
+        model.load_state_dict(torch.load(weight_path, map_location=device))
+        model.eval()
+        models_ensemble.append(model)
+        print(f"成功加载第 {fold} 折黄金权重 (CPU模式)")
+    else:
+        print(f"警告: 未找到第 {fold} 折权重，将跳过。")
+
+if len(models_ensemble) == 0:
+    raise RuntimeError("没有找到任何训练好的权重文件，请检查权重目录是否准确！")
+
+all_preds, all_labels_eval, all_probs = [], [], []
+total_samples = len(test_dataset)
+total_cpu_time = 0.0
+
+print("\n开始纯 CPU 联合推理计算...")
+
+with torch.no_grad():
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device) # 数据送入 CPU
+        
+        start_time = time.perf_counter()
+        
+        ensemble_probs = torch.zeros((inputs.size(0), 2)).to(device)
+        for model in models_ensemble:
+            outputs = model(inputs)
+            ensemble_probs += torch.nn.functional.softmax(outputs, dim=1)
+        
+        ensemble_probs /= len(models_ensemble)
+        
+        total_cpu_time += (time.perf_counter() - start_time)
+        
+        probs = ensemble_probs[:, 1]
+        _, preds = torch.max(ensemble_probs, 1)
+        
+        all_preds.extend(preds.numpy())
+        all_labels_eval.extend(labels.numpy())
+        all_probs.extend(probs.numpy())
+
+cm = confusion_matrix(all_labels_eval, all_preds, labels=[0, 1])
+tn, fp, fn, tp = cm.ravel()
+
+acc = (tp + tn) / total_samples
+se = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+sp = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+auc = roc_auc_score(all_labels_eval, all_probs)
+f1 = f1_score(all_labels_eval, all_preds)
+time_ms = (total_cpu_time / total_samples) * 1000
+
+print("\n" + "="*60)
+print("422 外部验证集 (Zero-Shot 纯 CPU 跨域验证) 最终成绩单")
+print("="*60)
+print(f"Accuracy (ACC):      {acc*100:.2f}%")
+print(f"Sensitivity (SE):    {se*100:.2f}%")
+print(f"Specificity (SP):    {sp*100:.2f}%")
+print(f"F1 Score:            {f1:.4f}")
+print(f"AUC Score:           {auc:.4f}")
+print(f"CPU 单张推理耗时:   {time_ms:.2f} ms (5 模型集成累计耗时)")
+print("="*60)
