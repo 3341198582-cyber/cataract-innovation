@@ -1,0 +1,257 @@
+import os
+import cv2
+import time
+import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+from torchvision import models, transforms
+from torch.utils.data import Dataset, DataLoader, Subset
+from PIL import Image
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import confusion_matrix, roc_auc_score, f1_score
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+base_src = '/home/ubuntu/cataract_project_data'
+mask_root = os.path.join(base_src, '2_SAM_Masks_Isolated')
+device = torch.device("cpu") 
+print("=== Step 5-C: DenseNet-121 内存动态融合 5-Fold CV (绝对公平版) ===\n")
+
+class CataractMaskDataset(Dataset):
+    def __init__(self, transform=None):
+        self.transform = transform
+        self.image_paths = []
+        class_map = {'normal': 0, 'cataract': 1}
+        
+        # 🚨 遍历两个 split，在内存中无缝拼接
+        splits = ['train', 'test']
+        
+        for split in splits:
+            for cls_name, label in class_map.items():
+                roi_dir = os.path.join(base_src, split, cls_name, f"{cls_name}_ROI")
+                mask_dir = os.path.join(mask_root, split, cls_name)
+                
+                if not os.path.exists(roi_dir): continue
+                    
+                for f in os.listdir(roi_dir):
+                    if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        file_name, file_ext = os.path.splitext(f)
+                        mask_name = f"{file_name}_SAMmask{file_ext}"
+                        mask_path = os.path.join(mask_dir, mask_name)
+                        
+                        if os.path.exists(mask_path):
+                            self.image_paths.append({
+                                'roi': os.path.join(roi_dir, f),
+                                'mask': mask_path,
+                                'label': label
+                            })
+
+        print(f"✅ 内存级合并完毕：成功配对 {len(self.image_paths)} 张 (ROI + Mask)")
+
+    def __len__(self): return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        item = self.image_paths[idx]
+        img = cv2.imread(item['roi'])
+        mask = cv2.imread(item['mask'], cv2.IMREAD_GRAYSCALE)
+        
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        if img.shape[:2] != mask.shape:
+            mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            
+        img_combined = cv2.bitwise_and(img, img, mask=mask)
+        img_combined = cv2.cvtColor(img_combined, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_combined)
+        
+        if self.transform: 
+            pil_img = self.transform(pil_img)
+        return pil_img, item['label']
+
+train_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.RandomAffine(degrees=15, translate=(0.05, 0.05)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+    transforms.ToTensor(),
+    transforms.RandomErasing(p=0.2, scale=(0.02, 0.05), ratio=(0.5, 2.0), value=0),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+test_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+dataset_train_base = CataractMaskDataset(transform=train_transform)
+dataset_val_base = CataractMaskDataset(transform=test_transform)
+all_labels = [item['label'] for item in dataset_train_base.image_paths]
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (self.alpha * (1 - pt) ** self.gamma * ce_loss).mean()
+        return focal_loss
+
+epochs = 50
+k_folds = 5
+skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=42)
+
+final_metrics = {'acc': [], 'se': [], 'sp': [], 'f1': [], 'auc': [], 'loss': [], 'time': []}
+
+print("\n开启 DenseNet-121 绝对公平版 5-Fold 训练!")
+
+for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(all_labels)), all_labels)):
+    print(f"\n{'='*50}")
+    print(f 开始第 {fold + 1} 折训练 (Fold {fold + 1}/{k_folds})")
+    print(f"{'='*50}")
+
+    train_sub = Subset(dataset_train_base, train_idx)
+    val_sub = Subset(dataset_val_base, val_idx)
+
+    # 保持 CNN 阵营的 batch_size=4
+    train_loader = DataLoader(train_sub, batch_size=4, shuffle=True)
+    val_loader = DataLoader(val_sub, batch_size=4, shuffle=False)
+
+    # 重新初始化模型 DenseNet-121
+    model = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+    num_ftrs = model.classifier.in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(0.2), 
+        nn.Linear(num_ftrs, 2)
+    )
+    model = model.to(device)
+
+    criterion = FocalLoss(alpha=0.25, gamma=2.0)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.03)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    best_acc = 0.0
+    weight_save_path = os.path.join(base_src, f"densenet121_strict_fold_{fold + 1}.pth")
+
+    for epoch in range(epochs):
+        model.train()
+        train_correct, train_total, running_loss = 0, 0, 0.0
+        
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * inputs.size(0)
+            _, preds = torch.max(outputs, 1)
+            train_total += labels.size(0)
+            train_correct += torch.sum(preds == labels.data).item()
+            
+        scheduler.step()
+        
+        # --- 训练过程中的验证 ---
+        model.eval()
+        val_correct, val_total = 0, 0
+        with torch.no_grad():
+            for val_inputs, val_labels in val_loader:
+                val_inputs, val_labels = val_inputs.to(device), val_labels.to(device)
+                val_outputs = model(val_inputs)
+                _, val_predicted = torch.max(val_outputs.data, 1)
+                val_total += val_labels.size(0)
+                val_correct += torch.sum(val_predicted == val_labels.data).item()
+                
+        val_acc = val_correct / val_total
+        
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"Epoch [{epoch+1:02d}/{epochs}] | Train Loss: {running_loss/train_total:.4f} | Train Acc: {train_correct/train_total:.2%} | Val Acc: {val_acc:.2%} | LR: {scheduler.get_last_lr()[0]:.7f}")
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), weight_save_path)
+
+    print(f"\n第 {fold + 1} 折训练结束！正在使用最佳权重进行全指标评估...")
+    
+    eval_model = models.densenet121()
+    eval_model.classifier = nn.Sequential(nn.Dropout(0.2), nn.Linear(num_ftrs, 2))
+    eval_model.load_state_dict(torch.load(weight_save_path, map_location=device))
+    eval_model = eval_model.to(device)
+    eval_model.eval()
+    
+    all_preds, all_labels_eval, all_probs = [], [], []
+    total_samples = len(val_loader.dataset)
+    test_running_loss, total_pure_inference_time = 0.0, 0.0
+    
+    if torch.cuda.is_available():
+        _ = eval_model(torch.randn(1, 3, 256, 256).to(device))
+
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            outputs = eval_model(inputs)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            
+            total_pure_inference_time += (end_time - start_time)
+            
+            loss = criterion(outputs, labels)
+            test_running_loss += loss.item() * inputs.size(0)
+            
+            probs = torch.nn.functional.softmax(outputs, dim=1)[:, 1] 
+            _, preds = torch.max(outputs, 1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels_eval.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    cm = confusion_matrix(all_labels_eval, all_preds, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    
+    fold_acc = (tp + tn) / (tp + tn + fp + fn)
+    fold_se = tp / (tp + fn) if (tp + fn) > 0 else 0.0  
+    fold_sp = tn / (tn + fp) if (tn + fp) > 0 else 0.0  
+    fold_auc = roc_auc_score(all_labels_eval, all_probs)
+    fold_f1 = f1_score(all_labels_eval, all_preds) 
+    fold_loss = test_running_loss / total_samples
+    fold_time_ms = (total_pure_inference_time / total_samples) * 1000
+
+    final_metrics['acc'].append(fold_acc)
+    final_metrics['se'].append(fold_se)
+    final_metrics['sp'].append(fold_sp)
+    final_metrics['f1'].append(fold_f1)
+    final_metrics['auc'].append(fold_auc)
+    final_metrics['loss'].append(fold_loss)
+    final_metrics['time'].append(fold_time_ms)
+
+    print(f"Fold {fold + 1} 成绩单 -> ACC: {fold_acc*100:.2f}% | LOSS: {fold_loss:.4f} | SE: {fold_se*100:.2f}% | SP: {fold_sp*100:.2f}% | F1: {fold_f1:.4f} | AUC: {fold_auc:.4f} | Time: {fold_time_ms:.2f} ms")
+
+print("\n" + "="*50)
+print("终极报告：DenseNet-121 5-Fold 交叉验证全指标")
+print("="*50)
+print(f"Accuracy (准确率):    {np.mean(final_metrics['acc'])*100:.2f}% ± {np.std(final_metrics['acc'])*100:.2f}%")
+print(f"Loss (测试损失):      {np.mean(final_metrics['loss']):.4f} ± {np.std(final_metrics['loss']):.4f}")
+print(f"Sensitivity (敏感度): {np.mean(final_metrics['se'])*100:.2f}% ± {np.std(final_metrics['se'])*100:.2f}%")
+print(f"🛡Specificity (特异度): {np.mean(final_metrics['sp'])*100:.2f}% ± {np.std(final_metrics['sp'])*100:.2f}%")
+print(f"F1 Score:             {np.mean(final_metrics['f1']):.4f} ± {np.std(final_metrics['f1']):.4f}")
+print(f"AUC Score:            {np.mean(final_metrics['auc']):.4f} ± {np.std(final_metrics['auc']):.4f}")
+print(f"Inference Time:       {np.mean(final_metrics['time']):.2f} ms ± {np.std(final_metrics['time']):.2f} ms")
+print("==================================================")

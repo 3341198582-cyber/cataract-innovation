@@ -1,0 +1,83 @@
+import cv2
+import os
+import numpy as np
+import shutil
+
+base_src = '/home/ubuntu/cataract_project_data'
+
+print("=== 几何特征识别版 (无视位置偏移，专抓圆形) ===\n")
+
+total_processed = 0
+
+for sp in ['train', 'test']:
+    for cls in ['cataract', 'normal']:
+        src_dir = os.path.join(base_src, sp, cls)
+        pupil_dir = os.path.join(src_dir, f"{cls}_pupil")
+        
+        if not os.path.exists(src_dir): continue
+        
+        if os.path.exists(pupil_dir):
+            shutil.rmtree(pupil_dir)
+        os.makedirs(pupil_dir, exist_ok=True)
+        os.system(f'chmod 777 "{pupil_dir}"')
+
+        files = sorted([f for f in os.listdir(src_dir) if os.path.isfile(os.path.join(src_dir, f)) and f.lower().endswith(('.png', '.jpg'))])
+        print(f" 正在进行全图几何形状扫描: {sp}/{cls} (共 {len(files)} 张)...")
+
+        for f in files:
+            img = cv2.imread(os.path.join(src_dir, f))
+            if img is None: continue
+            
+            h, w = img.shape[:2]
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # 1. 中值滤波：最完美的去反光工具，直接抹掉小白点但不破坏瞳孔边缘
+            gray_med = cv2.medianBlur(gray, 11)
+            
+            # 2. 自适应局部二值化：把所有深色区域（瞳孔、虹膜、睫毛）全部变成白色硬块
+            block_size = int(min(w, h) * 0.25)
+            block_size = block_size if block_size % 2 != 0 else block_size + 1
+            thresh = cv2.adaptiveThreshold(gray_med, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block_size, 5)
+            
+            # 3. 形态学断开：把粘连在一起的睫毛和瞳孔切断
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+            
+            # 4. 寻找所有轮廓
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            best_center = (w // 2, h // 2) 
+            best_score = -1
+            
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                # 过滤掉太小（眼角碎影）或太大（半张脸）的区块
+                if area < (w * h) * 0.015 or area > (w * h) * 0.4:
+                    continue
+                    
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter == 0: continue
+                
+                # 计算圆度 (1.0为完美正圆。设定 > 0.35 容忍一定程度的眼皮遮挡)
+                circularity = 4 * np.pi * (area / (perimeter * perimeter))
+                
+                # 计算长宽比 (剔除细长的眼线和眉毛)
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                aspect_ratio = min(bw, bh) / max(bw, bh)
+                
+                if circularity > 0.35 and aspect_ratio > 0.5:
+                    score = area * circularity
+                    if score > best_score:
+                        best_score = score
+                        M = cv2.moments(cnt)
+                        if M["m00"] != 0:
+                            best_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+            
+            mask = np.zeros_like(gray)
+            cv2.circle(mask, best_center, int(min(w,h)*0.15), 255, -1)
+            cv2.imwrite(os.path.join(pupil_dir, f), mask)
+            total_processed += 1
+
+print("\n=====================================================")
+print(f"几何特征")

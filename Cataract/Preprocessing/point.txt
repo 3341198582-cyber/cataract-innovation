@@ -1,0 +1,70 @@
+import cv2
+import os
+import numpy as np
+
+base_src = '/home/ubuntu/cataract_project_data'
+target_size = 224
+
+print("===Step 3: 重新生成点位验证图 (正负向 Prompt) ===\n")
+
+for sp in ['train', 'test']:
+    for cls in ['cataract', 'normal']:
+        src_dir = os.path.join(base_src, sp, cls)
+        roi_dir = os.path.join(src_dir, f"{cls}_ROI")
+        pupil_dir = os.path.join(src_dir, f"{cls}_pupil")
+        point_dir = os.path.join(src_dir, f"{cls}_point")
+        
+        if not os.path.exists(roi_dir) or not os.path.exists(pupil_dir): continue
+        os.makedirs(point_dir, exist_ok=True)
+        os.system(f'chmod 777 "{point_dir}"')
+
+        files = sorted([f for f in os.listdir(roi_dir) if f.lower().endswith(('.png', '.jpg'))])
+        print(f"正在定位: {sp}/{cls} (共 {len(files)} 张)...")
+
+        for f in files:
+            img_roi = cv2.imread(os.path.join(roi_dir, f))
+            mask_orig = cv2.imread(os.path.join(pupil_dir, f), cv2.IMREAD_GRAYSCALE)
+            
+            if img_roi is None or mask_orig is None: continue
+            h_orig, w_orig = mask_orig.shape[:2]
+
+            # 还原坐标逻辑
+            y_coords, x_coords = np.where(mask_orig > 127)
+            if len(y_coords) > 0:
+                cx, cy = int(np.mean(x_coords)), int(np.mean(y_coords))
+            else:
+                cx, cy = w_orig // 2, h_orig // 2
+
+            side = min(h_orig, w_orig)
+            half = side // 2
+
+            x1, y1 = cx - half, cy - half
+            x2, y2 = cx + half, cy + half
+
+            if x1 < 0: x2 -= x1; x1 = 0
+            if y1 < 0: y2 -= y1; y1 = 0
+            if x2 > w_orig: x1 -= (x2 - w_orig); x2 = w_orig
+            if y2 > h_orig: y1 -= (y2 - h_orig); y2 = h_orig
+
+            # 计算在 224x224 上的绝对红点坐标
+            red_x = int((cx - x1) * target_size / side)
+            red_y = int((cy - y1) * target_size / side)
+            red_x = np.clip(red_x, 0, target_size - 1)
+            red_y = np.clip(red_y, 0, target_size - 1)
+
+            # 画红点
+            cv2.circle(img_roi, (red_x, red_y), 5, (0, 0, 255), -1)
+
+            # 画蓝点
+            offset = 15
+            blue_pts = [
+                (offset, offset), (target_size - offset, offset), 
+                (offset, target_size - offset), (target_size - offset, target_size - offset)
+            ]
+            for bpt in blue_pts:
+                cv2.circle(img_roi, bpt, 5, (255, 0, 0), -1)
+
+            # 自动覆盖旧文件
+            cv2.imwrite(os.path.join(point_dir, f), img_roi)
+
+print("\n Step 3红蓝点验证图")

@@ -1,0 +1,94 @@
+import cv2
+import os
+import numpy as np
+import torch
+from segment_anything import sam_model_registry, SamPredictor
+
+base_src = '/home/ubuntu/cataract_project_data'
+
+safe_mask_root = os.path.join(base_src, '2_SAM_Masks_Isolated')
+
+print("=== Step 4: SAM 大模型全自动零样本抠图===\n")
+
+sam_checkpoint = os.path.join(base_src, "sam_vit_b_01ec64.pth")
+if not os.path.exists(sam_checkpoint):
+    print("❌ 找不到权重文件！请确保 sam_vit_b_01ec64.pth 在正确目录下。")
+    exit()
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+sam = sam_model_registry["vit_b"](checkpoint=sam_checkpoint)
+sam.to(device=device)
+predictor = SamPredictor(sam)
+
+total_masks = 0
+
+for sp in ['train', 'test']:
+    for cls in ['cataract', 'normal']:
+        src_dir = os.path.join(base_src, sp, cls)
+        roi_dir = os.path.join(src_dir, f"{cls}_ROI")
+        point_dir = os.path.join(src_dir, f"{cls}_point")
+        
+        mask_dir = os.path.join(safe_mask_root, sp, cls)
+        
+        if not os.path.exists(roi_dir) or not os.path.exists(point_dir): continue
+        
+        # 创建新的隔离掩膜文件夹
+        os.makedirs(mask_dir, exist_ok=True)
+        os.system(f'chmod 777 -R "{safe_mask_root}"')
+
+        files = sorted([f for f in os.listdir(point_dir) if f.lower().endswith(('.png', '.jpg'))])
+        print(f"\n正在智能分割: {sp}/{cls} (共 {len(files)} 张)...")
+
+        for f in files:
+            roi_path = os.path.join(roi_dir, f)
+            point_path = os.path.join(point_dir, f)
+            
+            img_roi = cv2.imread(roi_path)
+            img_point = cv2.imread(point_path)
+            
+            if img_roi is None or img_point is None: continue
+
+            red_mask = cv2.inRange(img_point, np.array([0, 0, 200]), np.array([50, 50, 255]))
+            blue_mask = cv2.inRange(img_point, np.array([200, 0, 0]), np.array([255, 50, 50]))
+            
+            red_y, red_x = np.where(red_mask > 0)
+            if len(red_x) == 0: 
+                print(f"⚠️ 跳过 {f}：未检测到红点。")
+                continue 
+
+            input_points = [[int(np.mean(red_x)), int(np.mean(red_y))]]
+            input_labels = [1] 
+
+            num_labels, _, _, centroids = cv2.connectedComponentsWithStats(blue_mask, connectivity=8)
+            for i in range(1, num_labels):
+                input_points.append([int(centroids[i][0]), int(centroids[i][1])])
+                input_labels.append(0) 
+
+            # ====================================================
+            # SAM 预测核心逻辑
+            # ====================================================
+            predictor.set_image(cv2.cvtColor(img_roi, cv2.COLOR_BGR2RGB))
+            
+            masks, _, _ = predictor.predict(
+                point_coords=np.array(input_points),
+                point_labels=np.array(input_labels),
+                multimask_output=False 
+            )
+
+            # ====================================================
+            # 后处理与保存
+            # ====================================================
+            final_mask = (masks[0] * 255).astype(np.uint8)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)
+
+            file_name, file_ext = os.path.splitext(f)
+            new_file_name = f"{file_name}_SAMmask{file_ext}"
+            
+            # 存入绝对隔离区
+            cv2.imwrite(os.path.join(mask_dir, new_file_name), final_mask)
+            total_masks += 1
+
+print("\n=====================================================")
+print(f"掩码图")
